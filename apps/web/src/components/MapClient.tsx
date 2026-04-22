@@ -1,34 +1,63 @@
 'use client';
 import { useEffect, useMemo, useState } from 'react';
 import dynamic from 'next/dynamic';
+import { useAuth } from '@clerk/nextjs';
 import { useSupabase } from '@/lib/use-supabase';
 import type { Flight, UserPreferences } from '@/lib/types';
 import PreferencesPanel from './PreferencesPanel';
 
-// Leaflet needs window; disable SSR for the actual map.
 const FlightMap = dynamic(() => import('./FlightMap'), { ssr: false });
 
 export default function MapClient() {
   const supabase = useSupabase();
+  const { getToken } = useAuth();
   const [flights, setFlights] = useState<Map<string, Flight>>(new Map());
   const [prefs, setPrefs] = useState<UserPreferences | null>(null);
   const [loaded, setLoaded] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
 
-  // Initial load + realtime subscription.
   useEffect(() => {
     let cancelled = false;
 
     (async () => {
-      const [{ data: rows }, { data: pref }] = await Promise.all([
-        supabase.from('flights').select('*').not('latitude', 'is', null).limit(2000),
-        supabase.from('user_preferences').select('*').maybeSingle(),
-      ]);
-      if (cancelled) return;
-      const m = new Map<string, Flight>();
-      for (const r of (rows ?? []) as Flight[]) m.set(r.icao24, r);
-      setFlights(m);
-      setPrefs(pref as UserPreferences | null);
-      setLoaded(true);
+      try {
+        // Diagnostic: what issuer is our Clerk token? Supabase must recognize it.
+        const tok = await getToken();
+        if (tok) {
+          const payload = JSON.parse(atob(tok.split('.')[1]));
+          console.log('[clerk] iss=%s sub=%s aud=%s', payload.iss, payload.sub, payload.aud);
+        } else {
+          console.warn('[clerk] no token returned');
+        }
+
+        const [flightsRes, prefsRes] = await Promise.all([
+          supabase.from('flights').select('*').not('latitude', 'is', null).limit(2000),
+          supabase.from('user_preferences').select('*').maybeSingle(),
+        ]);
+        if (cancelled) return;
+
+        if (flightsRes.error) {
+          console.error('[supabase] flights error', flightsRes.error);
+          setErr(`flights: ${flightsRes.error.message}`);
+        }
+        if (prefsRes.error) console.error('[supabase] prefs error', prefsRes.error);
+
+        const rows = (flightsRes.data ?? []) as Flight[];
+        console.log('[supabase] flights rows =', rows.length);
+
+        const m = new Map<string, Flight>();
+        for (const r of rows) m.set(r.icao24, r);
+        setFlights(m);
+        setPrefs(prefsRes.data as UserPreferences | null);
+        if (rows.length === 0 && !flightsRes.error) {
+          setErr('Query returned 0 flights. Supabase is treating you as anon — Clerk JWT is not being recognized. Check Supabase → Authentication → Third-party Auth → Clerk domain.');
+        }
+      } catch (e) {
+        console.error(e);
+        setErr(String(e));
+      } finally {
+        setLoaded(true);
+      }
     })();
 
     const channel = supabase
@@ -72,6 +101,11 @@ export default function MapClient() {
         {!loaded && (
           <div className="absolute inset-0 flex items-center justify-center text-slate-400">
             Loading flights…
+          </div>
+        )}
+        {err && (
+          <div className="absolute top-3 left-3 right-3 z-[1000] bg-red-950/90 border border-red-700 text-red-100 text-sm rounded px-3 py-2">
+            {err}
           </div>
         )}
         <FlightMap
