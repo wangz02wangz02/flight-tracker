@@ -4,6 +4,8 @@ import { useSupabase } from '@/lib/use-supabase';
 import { useUser } from '@clerk/nextjs';
 import type { UserPreferences } from '@/lib/types';
 
+const DENSITY_OPTIONS = [100, 200, 500, 1000, 2000, 3000, 5000, 10000];
+
 export default function PreferencesPanel({
   prefs,
   onChange,
@@ -18,8 +20,39 @@ export default function PreferencesPanel({
   const supabase = useSupabase();
   const { user } = useUser();
   const [country, setCountry] = useState(prefs?.filter_country ?? '');
+  const [density, setDensity] = useState(prefs?.flight_density ?? 500);
   const [saving, setSaving] = useState(false);
   const [status, setStatus] = useState<{ kind: 'ok' | 'err'; msg: string } | null>(null);
+
+  async function persist(nextDensity?: number, nextCountry?: string) {
+    if (!user) return;
+    const payload = {
+      user_id: user.id,
+      map_center_lat: prefs?.map_center_lat ?? 40,
+      map_center_lon: prefs?.map_center_lon ?? -95,
+      map_zoom: prefs?.map_zoom ?? 4,
+      filter_country: (nextCountry ?? country).trim() || null,
+      flight_density: nextDensity ?? density,
+    };
+    const { data, error } = await supabase
+      .from('user_preferences')
+      .upsert(payload, { onConflict: 'user_id' })
+      .select('*')
+      .single();
+    if (error) throw error;
+    onChange(data as UserPreferences);
+  }
+
+  async function pickDensity(n: number) {
+    setDensity(n);
+    // Optimistically update so the map responds instantly, then persist.
+    onChange({ ...(prefs ?? ({} as UserPreferences)), flight_density: n, user_id: user?.id ?? '' });
+    try {
+      await persist(n, country);
+    } catch (e) {
+      console.error('[prefs] density save error', e);
+    }
+  }
 
   async function save() {
     if (!user) {
@@ -35,6 +68,7 @@ export default function PreferencesPanel({
         map_center_lon: prefs?.map_center_lon ?? -95,
         map_zoom: prefs?.map_zoom ?? 4,
         filter_country: country.trim() || null,
+        flight_density: density,
       };
       const { data, error } = await supabase
         .from('user_preferences')
@@ -60,9 +94,24 @@ export default function PreferencesPanel({
   return (
     <div className="space-y-4 text-sm">
       <div>
-        <h2 className="font-semibold mb-1">Live feed</h2>
-        <p className="text-slate-400">
-          {flightCount.toLocaleString()} shown / {totalCount.toLocaleString()} tracked
+        <label className="block mb-1 text-slate-300">Show how many aircraft</label>
+        <div className="flex flex-wrap gap-1">
+          {DENSITY_OPTIONS.map(n => (
+            <button
+              key={n}
+              onClick={() => pickDensity(n)}
+              className={`text-xs px-2 py-1 rounded border transition-colors ${
+                density === n
+                  ? 'bg-sky-600 border-sky-500 text-white'
+                  : 'bg-slate-900 border-slate-700 text-slate-300 hover:bg-slate-800'
+              }`}
+            >
+              {n >= 1000 ? `${n / 1000}k` : n}
+            </button>
+          ))}
+        </div>
+        <p className="text-xs text-slate-500 mt-1">
+          Showing {flightCount.toLocaleString()} of {totalCount.toLocaleString()} tracked
         </p>
       </div>
 

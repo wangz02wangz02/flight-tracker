@@ -1,14 +1,7 @@
 import 'dotenv/config';
 import { createClient } from '@supabase/supabase-js';
 
-const {
-  SUPABASE_URL,
-  SUPABASE_SERVICE_ROLE_KEY,
-  OPENSKY_USERNAME,
-  OPENSKY_PASSWORD,
-  OPENSKY_BBOX,
-  POLL_INTERVAL_MS,
-} = process.env;
+const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, POLL_INTERVAL_MS } = process.env;
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   console.error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY');
@@ -19,72 +12,90 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false, autoRefreshToken: false },
 });
 
-const pollMs = Number(POLL_INTERVAL_MS ?? 30_000);
+const pollMs = Number(POLL_INTERVAL_MS ?? 15_000);
 
-// OpenSky /states/all returns a 17-element array per aircraft.
-// https://openskynetwork.github.io/opensky-api/rest.html#all-state-vectors
-type OpenSkyState = [
-  string,             // 0  icao24
-  string | null,      // 1  callsign
-  string,             // 2  origin_country
-  number | null,      // 3  time_position (unix)
-  number,             // 4  last_contact  (unix)
-  number | null,      // 5  longitude
-  number | null,      // 6  latitude
-  number | null,      // 7  baro_altitude
-  boolean,            // 8  on_ground
-  number | null,      // 9  velocity
-  number | null,      // 10 true_track
-  number | null,      // 11 vertical_rate
-  number[] | null,    // 12 sensors
-  number | null,      // 13 geo_altitude
-  string | null,      // 14 squawk
-  boolean,            // 15 spi
-  number,             // 16 position_source
+// adsb.lol /v2/point/{lat}/{lon}/{radius_nm} — radius capped at 250 nm. No auth,
+// no rate limit. We cover the major traffic regions with overlapping circles.
+// Aircraft present in multiple circles dedupe on icao24 upsert downstream.
+const POINTS: Array<{ lat: number; lon: number; dist: number; name: string }> = [
+  { lat: 40, lon: -95, dist: 250, name: 'US-Central' },
+  { lat: 40, lon: -75, dist: 250, name: 'US-East' },
+  { lat: 35, lon: -115, dist: 250, name: 'US-West' },
+  { lat: 25, lon: -80, dist: 250, name: 'US-South' },
+  { lat: 50, lon: 10, dist: 250, name: 'EU-Central' },
+  { lat: 51, lon: 0, dist: 250, name: 'UK' },
+  { lat: 41, lon: 2, dist: 250, name: 'Iberia/Med' },
+  { lat: 55, lon: 37, dist: 250, name: 'Moscow' },
+  { lat: 35, lon: 139, dist: 250, name: 'Japan' },
+  { lat: 22, lon: 114, dist: 250, name: 'HK/PRD' },
+  { lat: 39, lon: 117, dist: 250, name: 'N-China' },
+  { lat: 1, lon: 104, dist: 250, name: 'Singapore' },
+  { lat: -33, lon: 151, dist: 250, name: 'Sydney' },
+  { lat: 19, lon: 73, dist: 250, name: 'India' },
+  { lat: 25, lon: 55, dist: 250, name: 'Dubai' },
+  { lat: -23, lon: -46, dist: 250, name: 'Sao Paulo' },
+  { lat: 19, lon: -99, dist: 250, name: 'Mexico City' },
+  { lat: -34, lon: 18, dist: 250, name: 'Cape Town' },
 ];
 
-type OpenSkyResponse = { time: number; states: OpenSkyState[] | null };
+// adsb.lol aircraft shape (only the fields we care about).
+type AdsbAircraft = {
+  hex: string;
+  flight?: string;
+  lat?: number;
+  lon?: number;
+  alt_baro?: number | 'ground';
+  gs?: number;
+  track?: number;
+  baro_rate?: number;
+  squawk?: string;
+  emergency?: string;
+  r?: string;
+  t?: string;
+  seen_pos?: number;
+};
 
-function buildUrl(): string {
-  const base = 'https://opensky-network.org/api/states/all';
-  if (!OPENSKY_BBOX) return base;
-  const [minLat, maxLat, minLon, maxLon] = OPENSKY_BBOX.split(',').map(s => s.trim());
-  const p = new URLSearchParams({ lamin: minLat, lamax: maxLat, lomin: minLon, lomax: maxLon });
-  return `${base}?${p.toString()}`;
+type AdsbResponse = { ac?: AdsbAircraft[] };
+
+async function fetchPoint(p: (typeof POINTS)[number]): Promise<AdsbAircraft[]> {
+  const url = `https://api.adsb.lol/v2/point/${p.lat}/${p.lon}/${p.dist}`;
+  const res = await fetch(url, { headers: { 'User-Agent': 'flight-tracker/1.0' } });
+  if (!res.ok) throw new Error(`adsb.lol ${p.name} ${res.status}`);
+  const data = (await res.json()) as AdsbResponse;
+  return data.ac ?? [];
 }
 
-function authHeader(): Record<string, string> {
-  if (!OPENSKY_USERNAME || !OPENSKY_PASSWORD) return {};
-  const token = Buffer.from(`${OPENSKY_USERNAME}:${OPENSKY_PASSWORD}`).toString('base64');
-  return { Authorization: `Basic ${token}` };
-}
+// Feet → meters
+const ftToM = (ft: number) => ft * 0.3048;
+// Knots → m/s
+const ktToMs = (kt: number) => kt * 0.514444;
+// ft/min → m/s
+const fpmToMs = (fpm: number) => fpm * 0.00508;
 
-async function fetchStates(): Promise<OpenSkyState[]> {
-  const res = await fetch(buildUrl(), { headers: authHeader() });
-  if (!res.ok) throw new Error(`OpenSky ${res.status}: ${await res.text()}`);
-  const data = (await res.json()) as OpenSkyResponse;
-  return data.states ?? [];
-}
-
-function toRow(s: OpenSkyState) {
+function toRow(a: AdsbAircraft) {
+  const altFt = typeof a.alt_baro === 'number' ? a.alt_baro : null;
+  const onGround = a.alt_baro === 'ground';
+  const lastContact = a.seen_pos
+    ? new Date(Date.now() - a.seen_pos * 1000).toISOString()
+    : new Date().toISOString();
   return {
-    icao24: s[0],
-    callsign: s[1]?.trim() || null,
-    origin_country: s[2],
-    last_contact: new Date(s[4] * 1000).toISOString(),
-    longitude: s[5],
-    latitude: s[6],
-    baro_altitude: s[7],
-    on_ground: s[8],
-    velocity: s[9],
-    true_track: s[10],
-    vertical_rate: s[11],
+    icao24: a.hex.toLowerCase(),
+    callsign: a.flight?.trim() || null,
+    origin_country: null as string | null,
+    last_contact: lastContact,
+    longitude: a.lon ?? null,
+    latitude: a.lat ?? null,
+    baro_altitude: altFt != null ? ftToM(altFt) : null,
+    on_ground: onGround,
+    velocity: a.gs != null ? ktToMs(a.gs) : null,
+    true_track: a.track ?? null,
+    vertical_rate: a.baro_rate != null ? fpmToMs(a.baro_rate) : null,
+    squawk: a.squawk ?? null,
     updated_at: new Date().toISOString(),
   };
 }
 
 async function upsertBatch(rows: ReturnType<typeof toRow>[]) {
-  // Supabase limits payload size; chunk to be safe.
   const CHUNK = 500;
   for (let i = 0; i < rows.length; i += CHUNK) {
     const chunk = rows.slice(i, i + CHUNK);
@@ -96,16 +107,29 @@ async function upsertBatch(rows: ReturnType<typeof toRow>[]) {
 async function tick() {
   const t0 = Date.now();
   try {
-    const states = await fetchStates();
-    const rows = states
-      .filter(s => s[5] !== null && s[6] !== null) // must have lon/lat
-      .map(toRow);
+    const results = await Promise.allSettled(POINTS.map(fetchPoint));
+    const seen = new Map<string, AdsbAircraft>();
+    let failures = 0;
+    for (const r of results) {
+      if (r.status === 'rejected') {
+        failures++;
+        continue;
+      }
+      for (const a of r.value) {
+        if (a.lat == null || a.lon == null) continue;
+        // Dedupe — aircraft in overlapping circles.
+        seen.set(a.hex.toLowerCase(), a);
+      }
+    }
+    const rows = Array.from(seen.values()).map(toRow);
     if (rows.length === 0) {
-      console.log('[poll] no rows');
+      console.warn(`[poll] 0 rows (${failures} region fetch failures)`);
       return;
     }
     await upsertBatch(rows);
-    console.log(`[poll] upserted ${rows.length} flights in ${Date.now() - t0}ms`);
+    console.log(
+      `[poll] upserted ${rows.length} flights in ${Date.now() - t0}ms (${failures} region failures)`,
+    );
   } catch (err) {
     console.error('[poll] error:', err);
   }
@@ -127,5 +151,7 @@ function shutdown(sig: string) {
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 
-console.log(`[worker] starting; polling every ${pollMs}ms${OPENSKY_BBOX ? ` bbox=${OPENSKY_BBOX}` : ' (global)'}`);
+console.log(
+  `[worker] starting; source=adsb.lol points=${POINTS.length} poll=${pollMs}ms`,
+);
 loop();

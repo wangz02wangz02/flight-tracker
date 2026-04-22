@@ -13,4 +13,43 @@ html, body {
 /* Leaflet tile layer needs a fixed height parent */
 .leaflet-container {
   background: #0b0f17;
+  font-family: inherit;
+}
+
+/* Dark-theme Leaflet popups */
+.leaflet-popup-content-wrapper,
+.leaflet-popup-tip {
+  background: #f8fafc;
+  color: #0f172a;
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+}
+.leaflet-popup-content {
+  margin: 10px 12px;
+}
+.leaflet-container a.leaflet-popup-close-button {
+  color: #64748b;
+}
+.leaflet-container a.leaflet-popup-close-button:hover {
+  color: #0f172a;
+}
+
+/* Subtle glow on hovered plane markers */
+.plane-icon {
+  transition: filter 0.15s ease;
+}
+.plane-icon:hover {
+  filter: drop-shadow(0 0 4px rgba(56, 189, 248, 0.8));
+}
+
+/* Scrollbar in sidebar */
+aside::-webkit-scrollbar {
+  width: 6px;
+}
+aside::-webkit-scrollbar-thumb {
+  background: #334155;
+  border-radius: 3px;
+}
+aside::-webkit-scrollbar-track {
+  background: transparent;
 }

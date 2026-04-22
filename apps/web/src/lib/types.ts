@@ -10,6 +10,7 @@ export type Flight = {
   vertical_rate: number | null;
   on_ground: boolean | null;
   last_contact: string | null;
+  squawk: string | null;
   updated_at: string;
 };
 
@@ -19,6 +20,7 @@ export type UserPreferences = {
   map_center_lon: number;
   map_zoom: number;
   filter_country: string | null;
+  flight_density: number;
 };
 
 export type UserFavorite = {

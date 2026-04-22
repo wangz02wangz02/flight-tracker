@@ -1,5 +1,6 @@
 'use client';
 import { useEffect, useState } from 'react';
+import { useAuth } from '@clerk/nextjs';
 import { useSupabase } from '@/lib/use-supabase';
 import type { Flight, UserFavorite } from '@/lib/types';
 
@@ -7,6 +8,7 @@ type Row = UserFavorite & { flight: Flight | null };
 
 export default function FavoritesClient() {
   const supabase = useSupabase();
+  const { getToken } = useAuth();
   const [rows, setRows] = useState<Row[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -34,22 +36,27 @@ export default function FavoritesClient() {
 
     load();
 
-    const channel = supabase
-      .channel('fav-flights')
-      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'flights' }, payload => {
-        const f = payload.new as Flight;
-        setRows(prev => prev.map(r => (r.icao24 === f.icao24 ? { ...r, flight: f } : r)));
-      })
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'user_favorites' }, () => {
-        load();
-      })
-      .subscribe();
+    let channel: ReturnType<typeof supabase.channel> | null = null;
+    (async () => {
+      const tok = await getToken();
+      if (tok) supabase.realtime.setAuth(tok);
+      channel = supabase
+        .channel('fav-flights')
+        .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'flights' }, payload => {
+          const f = payload.new as Flight;
+          setRows(prev => prev.map(r => (r.icao24 === f.icao24 ? { ...r, flight: f } : r)));
+        })
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'user_favorites' }, () => {
+          load();
+        })
+        .subscribe();
+    })();
 
     return () => {
       cancelled = true;
-      supabase.removeChannel(channel);
+      if (channel) supabase.removeChannel(channel);
     };
-  }, [supabase]);
+  }, [supabase, getToken]);
 
   async function remove(id: string) {
     await supabase.from('user_favorites').delete().eq('id', id);
@@ -71,16 +78,19 @@ function FavoriteCard({ row, onRemove }: { row: Row; onRemove: () => void }) {
   const supabase = useSupabase();
   const [notes, setNotes] = useState(row.notes ?? '');
   const [status, setStatus] = useState<'idle' | 'saving' | 'saved' | 'err'>('idle');
+  const [errMsg, setErrMsg] = useState<string | null>(null);
   const dirty = notes !== (row.notes ?? '');
 
   async function save() {
     setStatus('saving');
+    setErrMsg(null);
     const { error } = await supabase
       .from('user_favorites')
       .update({ notes: notes.trim() || null })
       .eq('id', row.id);
     if (error) {
       console.error('[notes] save error', error);
+      setErrMsg(error.message);
       setStatus('err');
       return;
     }
@@ -128,6 +138,7 @@ function FavoriteCard({ row, onRemove }: { row: Row; onRemove: () => void }) {
           {status === 'saved' && <span className="text-xs text-emerald-400">Saved ✓</span>}
           {status === 'err' && <span className="text-xs text-red-400">Save failed</span>}
         </div>
+        {errMsg && <p className="text-[11px] text-red-400 mt-1 break-words">{errMsg}</p>}
       </div>
     </li>
   );
