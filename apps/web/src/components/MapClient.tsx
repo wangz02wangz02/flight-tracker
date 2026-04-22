@@ -16,6 +16,13 @@ export default function MapClient() {
   const [loaded, setLoaded] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [showWeather, setShowWeather] = useState(true);
+  const [lastUpdate, setLastUpdate] = useState<number | null>(null);
+  const [eventCount, setEventCount] = useState(0);
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setTick(t => t + 1), 1000);
+    return () => clearInterval(id);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -67,6 +74,8 @@ export default function MapClient() {
         'postgres_changes',
         { event: '*', schema: 'public', table: 'flights' },
         payload => {
+          setLastUpdate(Date.now());
+          setEventCount(c => c + 1);
           setFlights(prev => {
             const next = new Map(prev);
             if (payload.eventType === 'DELETE') {
@@ -79,7 +88,7 @@ export default function MapClient() {
           });
         },
       )
-      .subscribe();
+      .subscribe(status => console.log('[realtime] channel status:', status));
 
     return () => {
       cancelled = true;
@@ -97,6 +106,26 @@ export default function MapClient() {
     <div className="flex-1 grid md:grid-cols-[320px_1fr] grid-rows-[auto_1fr] md:grid-rows-1">
       <aside className="p-4 border-r border-slate-800 bg-slate-950 overflow-y-auto space-y-4">
         <PreferencesPanel prefs={prefs} onChange={setPrefs} flightCount={filtered.length} totalCount={flights.size} />
+
+        <div className="text-xs border-t border-slate-800 pt-3 space-y-1">
+          <div className="flex items-center gap-2">
+            <span
+              className={`inline-block w-2 h-2 rounded-full ${
+                lastUpdate && Date.now() - lastUpdate < 60_000 ? 'bg-emerald-400 animate-pulse' : 'bg-slate-600'
+              }`}
+            />
+            <span className="text-slate-300">Realtime</span>
+            <span className="text-slate-500 ml-auto">{eventCount.toLocaleString()} events</span>
+          </div>
+          <p className="text-slate-500">
+            Last update:{' '}
+            {lastUpdate ? `${Math.max(0, Math.round((Date.now() - lastUpdate) / 1000))}s ago` : 'waiting…'}
+          </p>
+          <p className="text-slate-500">
+            Source: OpenSky Network → worker → Supabase Realtime
+          </p>
+        </div>
+
         <label className="flex items-center gap-2 text-sm border-t border-slate-800 pt-3">
           <input
             type="checkbox"

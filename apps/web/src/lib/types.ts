@@ -26,5 +26,6 @@ export type UserFavorite = {
   user_id: string;
   icao24: string;
   label: string | null;
+  notes: string | null;
   created_at: string;
 };

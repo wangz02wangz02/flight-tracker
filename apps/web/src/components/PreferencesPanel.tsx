@@ -19,10 +19,15 @@ export default function PreferencesPanel({
   const { user } = useUser();
   const [country, setCountry] = useState(prefs?.filter_country ?? '');
   const [saving, setSaving] = useState(false);
+  const [status, setStatus] = useState<{ kind: 'ok' | 'err'; msg: string } | null>(null);
 
   async function save() {
-    if (!user) return;
+    if (!user) {
+      setStatus({ kind: 'err', msg: 'Not signed in' });
+      return;
+    }
     setSaving(true);
+    setStatus(null);
     try {
       const payload = {
         user_id: user.id,
@@ -36,8 +41,17 @@ export default function PreferencesPanel({
         .upsert(payload, { onConflict: 'user_id' })
         .select('*')
         .single();
-      if (error) throw error;
+      if (error) {
+        console.error('[prefs] save error', error);
+        setStatus({ kind: 'err', msg: error.message });
+        return;
+      }
       onChange(data as UserPreferences);
+      setStatus({ kind: 'ok', msg: 'Saved ✓' });
+      setTimeout(() => setStatus(null), 2000);
+    } catch (e) {
+      console.error(e);
+      setStatus({ kind: 'err', msg: String(e) });
     } finally {
       setSaving(false);
     }
@@ -67,6 +81,15 @@ export default function PreferencesPanel({
         >
           {saving ? 'Saving…' : 'Save preferences'}
         </button>
+        {status && (
+          <p
+            className={`mt-2 text-xs ${
+              status.kind === 'ok' ? 'text-emerald-400' : 'text-red-400'
+            }`}
+          >
+            {status.msg}
+          </p>
+        )}
       </div>
 
       <div className="text-xs text-slate-500 border-t border-slate-800 pt-3">
