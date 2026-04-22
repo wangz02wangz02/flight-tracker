@@ -43,6 +43,28 @@ function planeIcon(f: Flight): L.DivIcon {
   });
 }
 
+// Dead-reckon the position between worker refreshes using the plane's own
+// velocity + heading. last-known position becomes the integration origin;
+// every 1s tick nudges the marker forward along its track, so planes visibly
+// move between upserts instead of freezing. Capped at 120 s to avoid runaway
+// predictions on stale rows (a landed or out-of-coverage plane).
+const PROJECT_CAP_S = 120;
+function projectPos(f: Flight, nowMs: number): [number, number] | null {
+  if (f.latitude == null || f.longitude == null) return null;
+  if (f.on_ground || f.velocity == null || f.true_track == null || !f.updated_at) {
+    return [f.latitude, f.longitude];
+  }
+  const updatedMs = Date.parse(f.updated_at);
+  if (!updatedMs) return [f.latitude, f.longitude];
+  const elapsedS = Math.max(0, Math.min((nowMs - updatedMs) / 1000, PROJECT_CAP_S));
+  const dist = f.velocity * elapsedS; // meters
+  const hdg = (f.true_track * Math.PI) / 180;
+  const latRad = (f.latitude * Math.PI) / 180;
+  const dLat = (dist * Math.cos(hdg)) / 111_000;
+  const dLon = (dist * Math.sin(hdg)) / (111_000 * Math.cos(latRad));
+  return [f.latitude + dLat, f.longitude + dLon];
+}
+
 function Recenter({ center, zoom }: { center: [number, number]; zoom: number }) {
   const map = useMap();
   useEffect(() => {
@@ -68,6 +90,12 @@ export default function FlightMap({
   const [selected, setSelected] = useState<string | null>(null);
   const trailsRef = useRef<Map<string, Trail>>(new Map());
   const [, forceTick] = useState(0);
+  // Re-render every second so dead-reckoned positions advance visibly.
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNowMs(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
 
   // Append the current position of every flight to its in-memory trail on every
   // render. The realtime stream in MapClient mutates `flights` in place, so a
@@ -118,11 +146,13 @@ export default function FlightMap({
         />
       )}
 
-      {flights.map(f =>
-        f.latitude != null && f.longitude != null ? (
+      {flights.map(f => {
+        const pos = projectPos(f, nowMs);
+        if (!pos) return null;
+        return (
           <Marker
             key={f.icao24}
-            position={[f.latitude, f.longitude]}
+            position={pos}
             icon={planeIcon(f)}
             eventHandlers={{
               click: () => setSelected(f.icao24),
@@ -133,8 +163,8 @@ export default function FlightMap({
               <FlightPopup f={f} />
             </Popup>
           </Marker>
-        ) : null,
-      )}
+        );
+      })}
     </MapContainer>
   );
 }

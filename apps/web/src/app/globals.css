@@ -42,6 +42,13 @@ html, body {
   filter: drop-shadow(0 0 4px rgba(56, 189, 248, 0.8));
 }
 
+/* Smooth glide as dead-reckoned positions update each second. Leaflet sets
+   the marker's translate3d() transform, so animating that gives continuous
+   motion instead of per-second jumps. */
+.leaflet-marker-icon.plane-icon {
+  transition: transform 1s linear;
+}
+
 /* Scrollbar in sidebar */
 aside::-webkit-scrollbar {
   width: 6px;
