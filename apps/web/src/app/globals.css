@@ -1,0 +1,16 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: dark;
+}
+
+html, body {
+  height: 100%;
+  background: #0b0f17;
+  color: #e6edf3;
+}
+
+/* Leaflet tile layer needs a fixed height parent */
+.leaflet-container {
+  background: #0b0f17;
+}
