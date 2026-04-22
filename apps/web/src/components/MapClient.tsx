@@ -15,6 +15,7 @@ export default function MapClient() {
   const [prefs, setPrefs] = useState<UserPreferences | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [showWeather, setShowWeather] = useState(true);
 
   useEffect(() => {
     let cancelled = false;
@@ -94,8 +95,18 @@ export default function MapClient() {
 
   return (
     <div className="flex-1 grid md:grid-cols-[320px_1fr] grid-rows-[auto_1fr] md:grid-rows-1">
-      <aside className="p-4 border-r border-slate-800 bg-slate-950 overflow-y-auto">
+      <aside className="p-4 border-r border-slate-800 bg-slate-950 overflow-y-auto space-y-4">
         <PreferencesPanel prefs={prefs} onChange={setPrefs} flightCount={filtered.length} totalCount={flights.size} />
+        <label className="flex items-center gap-2 text-sm border-t border-slate-800 pt-3">
+          <input
+            type="checkbox"
+            checked={showWeather}
+            onChange={e => setShowWeather(e.target.checked)}
+            className="accent-sky-500"
+          />
+          Weather radar overlay
+          <span className="text-xs text-slate-500 ml-auto">RainViewer</span>
+        </label>
       </aside>
       <div className="relative">
         {!loaded && (
@@ -112,6 +123,7 @@ export default function MapClient() {
           flights={filtered}
           center={[prefs?.map_center_lat ?? 40, prefs?.map_center_lon ?? -95]}
           zoom={prefs?.map_zoom ?? 4}
+          showWeather={showWeather}
         />
       </div>
     </div>

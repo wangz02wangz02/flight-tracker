@@ -5,6 +5,7 @@ import { useEffect } from 'react';
 import 'leaflet/dist/leaflet.css';
 import type { Flight } from '@/lib/types';
 import FavoriteButton from './FavoriteButton';
+import WeatherLayer from './WeatherLayer';
 
 // A small plane icon, rotated by heading. SVG inlined as data URI.
 function planeIcon(heading: number) {
@@ -34,10 +35,12 @@ export default function FlightMap({
   flights,
   center,
   zoom,
+  showWeather = true,
 }: {
   flights: Flight[];
   center: [number, number];
   zoom: number;
+  showWeather?: boolean;
 }) {
   return (
     <MapContainer
@@ -47,9 +50,10 @@ export default function FlightMap({
       scrollWheelZoom
     >
       <TileLayer
-        attribution='&copy; OpenStreetMap contributors'
+        attribution='&copy; OpenStreetMap contributors &copy; CARTO'
         url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
       />
+      {showWeather && <WeatherLayer opacity={0.55} />}
       <Recenter center={center} zoom={zoom} />
       {flights.map(f =>
         f.latitude != null && f.longitude != null ? (
