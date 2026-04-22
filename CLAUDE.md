@@ -1,20 +1,21 @@
 # Flight Tracker — Architecture
 
-Real-time global flight tracker. A Railway-hosted worker polls the OpenSky
-Network, writes into Supabase, and a Next.js frontend on Vercel subscribes via
-Supabase Realtime so the map and favorites update live — no browser polling, no
-page refresh.
+Real-time global flight tracker. A Railway-hosted worker polls adsb.lol across
+18 global regions, writes into Supabase, and a Next.js frontend on Vercel uses
+Supabase Realtime as a heartbeat that triggers a coalesced REST refetch — so
+the map and favorites update live without a page refresh.
 
 ## Services
 
 ```
- OpenSky /states/all
-         │   (HTTP GET, every 30s)
+ adsb.lol /v2/point/{lat}/{lon}/{nm}  × 18 regions
+         │   (HTTP GET, every 15s, no auth, no rate limit)
          ▼
  ┌──────────────────────┐
  │ apps/worker (Railway)│  Node 22 + TypeScript
- │  - fetch states      │  SUPABASE_SERVICE_ROLE_KEY → bypasses RLS by design
- │  - upsert flights    │
+ │  - fetch per-region  │  SUPABASE_SERVICE_ROLE_KEY → bypasses RLS by design
+ │  - dedupe on icao24  │
+ │  - upsert flights    │  ~3.4k aircraft per tick
  └────────┬─────────────┘
           │ Postgres
           ▼
@@ -31,19 +32,28 @@ page refresh.
  │ apps/web (Vercel)    │  Next.js 16 + Tailwind v4 + Clerk
  │  - Clerk auth        │  Browser Supabase client sends Clerk JWT on every
  │  - Leaflet map       │   request via `accessToken` callback.
- │  - Realtime channel  │
+ │  - Realtime heartbeat│   Realtime triggers a coalesced REST refetch; a
+ │  - 30s poll fallback │   30 s poll stands in if the channel stalls.
  └──────────────────────┘
 ```
 
 ## Data flow
 
-1. Worker calls `https://opensky-network.org/api/states/all` every 30 s.
+1. Worker calls `https://api.adsb.lol/v2/point/{lat}/{lon}/{nm}` for 18 regions
+   in parallel every 15 s, deduping aircraft on `icao24` across overlapping
+   circles. adsb.lol replaced OpenSky after anonymous rate limits forced too
+   many retries; it needs no auth and has no published rate limit.
 2. Each aircraft is normalized into a `flights` row and **upserted** on
    `icao24` (the transponder address), updating position/altitude/velocity.
 3. Supabase Realtime publishes INSERT/UPDATE events on `public.flights` and
    `public.user_favorites`.
-4. The browser opens one channel and patches a local `Map<icao24, flight>` in
-   React state. Markers re-render; the map never reloads.
+4. The map subscribes to `flights` `postgres_changes`. A single tick produces
+   thousands of events — above the default Realtime channel throttle
+   (~10 evt/sec) — so the client treats any surviving event as a heartbeat
+   that schedules a debounced REST refetch via `.range()` pagination (10k-row
+   pool, client-side stride sampling to the user's selected density). A 30 s
+   poll runs as a safety net. The `/favorites` page is low-volume and
+   consumes Realtime payloads directly.
 
 ## Tables
 
@@ -80,6 +90,10 @@ database, not at the app.
 
 - Per-user **country filter** (`user_preferences.filter_country`) — stored and
   read through RLS-protected rows.
+- Per-user **flight density** (`user_preferences.flight_density`) — how many
+  aircraft to render (100 / 200 / 500 / 1k / 2k / 3k / 5k / 10k). Client
+  stride-samples the 10k-row pool to the chosen count; emergency squawks
+  (7500/7600/7700) are always unioned in and never sampled away.
 - Per-user **favorites** (`user_favorites`) — toggled from the map popup,
   listed on `/favorites`, live-updated as positions change.
 - Per-user **map center + zoom** — stored with preferences for future use.
@@ -88,7 +102,7 @@ database, not at the app.
 
 - Root `.env.example` documents every variable.
 - `apps/web/.env.example` — browser + Clerk + Supabase public keys.
-- `apps/worker/.env.example` — Supabase service role key + OpenSky bounding box.
+- `apps/worker/.env.example` — Supabase service role key + `POLL_INTERVAL_MS`.
 - Same values must also be set in the Vercel and Railway project dashboards.
 
 ## Deploy
@@ -97,8 +111,8 @@ database, not at the app.
   vars, deploy. Framework autodetects Next.js.
 - **Worker (Railway)**: new service → connect repo → root directory
   `apps/worker`. Build/start commands are in `apps/worker/railway.json`. Set
-  env vars (Supabase URL + service role, optional OpenSky creds + bbox,
-  `POLL_INTERVAL_MS`).
+  env vars (`SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `POLL_INTERVAL_MS`).
+  No credentials needed for adsb.lol.
 
 ## Supabase MCP
 
@@ -121,7 +135,7 @@ to verify RLS by running SELECTs impersonating different users.
 │   │   ├── src/components/   # MapClient, FlightMap, FavoriteButton, …
 │   │   ├── src/lib/          # supabase-browser, use-supabase, types
 │   │   └── src/middleware.ts # Clerk route protection
-│   └── worker/        # OpenSky poller → Supabase upsert
+│   └── worker/        # adsb.lol poller → Supabase upsert
 │       └── src/index.ts
 ├── supabase/
 │   ├── migrations/0001_init.sql

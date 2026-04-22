@@ -10,11 +10,27 @@ import Legend from './Legend';
 const FlightMap = dynamic(() => import('./FlightMap'), { ssr: false });
 
 const EMERGENCY_SQUAWKS = new Set(['7500', '7600', '7700']);
-// Minimum time between flushes. First event flushes instantly; further events
-// in the same window are coalesced so bursts don't rerender thousands of markers.
-const MIN_FLUSH_INTERVAL_MS = 5_000;
-// Upper bound for the initial load pool. We subsample client-side for density.
+
+// djb2 — cheap deterministic hash on icao24 for stable sampling.
+function hashIcao(id: string): number {
+  let h = 5381;
+  for (let i = 0; i < id.length; i++) h = ((h << 5) + h + id.charCodeAt(i)) | 0;
+  return h >>> 0;
+}
+// Supabase Realtime is the live signal: any postgres_changes event on flights
+// triggers a coalesced REST refetch. The channel is rate-limited (~10 evt/sec
+// on the default plan) under 3k+ upserts/tick, so we treat it as a heartbeat
+// rather than a data source — a single surviving event is enough to refresh.
+// A slower poll still runs as a safety net in case the channel stalls.
+const REALTIME_DEBOUNCE_MS = 1_000;
+const POLL_INTERVAL_MS = 15_000;
+// An aircraft that hasn't appeared in a refresh for this long is dropped.
+// Shorter ⇒ faster removal of landed/out-of-coverage planes; longer ⇒ less
+// flicker when a single region fetch fails on the worker. 2 worker ticks.
+const STALE_MS = 60_000;
+// Upper bound for what a single refresh fetches. Subsample client-side for density.
 const POOL_SIZE = 10_000;
+const PAGE = 1000;
 
 export default function MapClient() {
   const supabase = useSupabase();
@@ -25,7 +41,7 @@ export default function MapClient() {
   const [err, setErr] = useState<string | null>(null);
   const [showWeather, setShowWeather] = useState(true);
   const [lastUpdate, setLastUpdate] = useState<number | null>(null);
-  const [eventCount, setEventCount] = useState(0);
+  const [refreshCount, setRefreshCount] = useState(0);
   const [, setTick] = useState(0);
   useEffect(() => {
     const id = setInterval(() => setTick(t => t + 1), 1000);
@@ -34,124 +50,107 @@ export default function MapClient() {
 
   useEffect(() => {
     let cancelled = false;
+    let pollTimer: ReturnType<typeof setTimeout> | null = null;
+    let debounceTimer: ReturnType<typeof setTimeout> | null = null;
 
-    (async () => {
+    // Paginates through public.flights up to POOL_SIZE. Supabase REST caps a
+    // single response at 1000 rows by default, so we range-page until done.
+    async function fetchAllFlights(): Promise<Flight[] | null> {
+      const rows: Flight[] = [];
+      for (let from = 0; from < POOL_SIZE; from += PAGE) {
+        const to = Math.min(from + PAGE - 1, POOL_SIZE - 1);
+        const { data, error } = await supabase
+          .from('flights')
+          .select('*')
+          .not('latitude', 'is', null)
+          .order('icao24')
+          .range(from, to);
+        if (error) {
+          console.error('[supabase] flights error', error);
+          setErr(`flights: ${error.message}`);
+          return null;
+        }
+        const batch = (data ?? []) as Flight[];
+        rows.push(...batch);
+        if (batch.length < PAGE) break;
+      }
+      return rows;
+    }
+
+    async function refresh(initial = false) {
       try {
-        // Diagnostic: what issuer is our Clerk token? Supabase must recognize it.
-        const tok = await getToken();
-        if (tok) {
-          const payload = JSON.parse(atob(tok.split('.')[1]));
-          console.log('[clerk] iss=%s sub=%s aud=%s', payload.iss, payload.sub, payload.aud);
-        } else {
-          console.warn('[clerk] no token returned');
-        }
-
-        // Supabase REST defaults to 1000 rows per request. Page through until we
-        // reach POOL_SIZE or the server stops returning full pages.
-        const PAGE = 1000;
-        const rows: Flight[] = [];
-        for (let from = 0; from < POOL_SIZE; from += PAGE) {
-          const to = Math.min(from + PAGE - 1, POOL_SIZE - 1);
-          const { data, error } = await supabase
-            .from('flights')
-            .select('*')
-            .not('latitude', 'is', null)
-            .order('icao24')
-            .range(from, to);
-          if (error) {
-            console.error('[supabase] flights error', error);
-            setErr(`flights: ${error.message}`);
-            break;
+        if (initial) {
+          const tok = await getToken();
+          if (tok) {
+            const payload = JSON.parse(atob(tok.split('.')[1]));
+            console.log('[clerk] iss=%s sub=%s', payload.iss, payload.sub);
           }
-          const batch = (data ?? []) as Flight[];
-          rows.push(...batch);
-          if (batch.length < PAGE) break;
+          const prefsRes = await supabase.from('user_preferences').select('*').maybeSingle();
+          if (prefsRes.error) console.error('[supabase] prefs error', prefsRes.error);
+          setPrefs(prefsRes.data as UserPreferences | null);
         }
-        const prefsRes = await supabase.from('user_preferences').select('*').maybeSingle();
-        if (cancelled) return;
-        if (prefsRes.error) console.error('[supabase] prefs error', prefsRes.error);
-        console.log('[supabase] flights rows =', rows.length);
 
-        const m = new Map<string, Flight>();
-        for (const r of rows) m.set(r.icao24, r);
-        setFlights(m);
-        setPrefs(prefsRes.data as UserPreferences | null);
-        if (rows.length === 0) {
-          setErr('Query returned 0 flights. Supabase is treating you as anon — Clerk JWT is not being recognized. Check Supabase → Authentication → Third-party Auth → Clerk domain.');
+        const rows = await fetchAllFlights();
+        if (cancelled || rows == null) return;
+
+        // Merge instead of replace: a momentary gap in the response (region
+        // fetch failure, adsb.lol coverage flicker) shouldn't make planes
+        // disappear for one tick and reappear the next. Carry forward the
+        // prior entry; prune only when genuinely stale.
+        setFlights(prev => {
+          const next = new Map(prev);
+          for (const r of rows) next.set(r.icao24, r);
+          const nowMs = Date.now();
+          for (const [k, f] of next) {
+            const ts = f.updated_at ? new Date(f.updated_at).getTime() : 0;
+            if (nowMs - ts > STALE_MS) next.delete(k);
+          }
+          return next;
+        });
+        setLastUpdate(Date.now());
+        setRefreshCount(c => c + 1);
+        if (initial && rows.length === 0) {
+          setErr(
+            'Query returned 0 flights. Supabase is treating you as anon — Clerk JWT is not being recognized.',
+          );
         }
       } catch (e) {
-        console.error(e);
-        setErr(String(e));
+        console.error('[poll] refresh failed', e);
       } finally {
-        setLoaded(true);
+        if (initial) setLoaded(true);
+        if (!cancelled) pollTimer = setTimeout(() => refresh(false), POLL_INTERVAL_MS);
       }
-    })();
+    }
+
+    function scheduleRealtimeRefetch() {
+      if (debounceTimer) return;
+      debounceTimer = setTimeout(() => {
+        debounceTimer = null;
+        if (!cancelled) refresh(false);
+      }, REALTIME_DEBOUNCE_MS);
+    }
+
+    refresh(true);
 
     let channel: ReturnType<typeof supabase.channel> | null = null;
-
-    // Buffer realtime events in a mutable Map keyed by icao24 so a burst of 10k
-    // updates collapses to one entry per aircraft. First event flushes instantly;
-    // subsequent events within MIN_FLUSH_INTERVAL_MS are coalesced.
-    const pending = new Map<string, { kind: 'upsert' | 'delete'; row: Flight }>();
-    let bufferedEvents = 0;
-    let lastFlush = 0;
-    let flushTimer: ReturnType<typeof setTimeout> | null = null;
-
-    const flush = () => {
-      flushTimer = null;
-      lastFlush = Date.now();
-      if (pending.size === 0) return;
-      setFlights(prev => {
-        const next = new Map(prev);
-        for (const { kind, row } of pending.values()) {
-          if (kind === 'delete') next.delete(row.icao24);
-          else if (row.latitude != null && row.longitude != null) next.set(row.icao24, row);
-        }
-        return next;
-      });
-      pending.clear();
-      if (bufferedEvents > 0) {
-        setEventCount(c => c + bufferedEvents);
-        bufferedEvents = 0;
-      }
-      setLastUpdate(Date.now());
-    };
-
-    const scheduleFlush = () => {
-      if (flushTimer) return;
-      const wait = Math.max(0, MIN_FLUSH_INTERVAL_MS - (Date.now() - lastFlush));
-      flushTimer = setTimeout(flush, wait);
-    };
-
     (async () => {
-      // Make sure the realtime socket authenticates with the current Clerk JWT
-      // BEFORE subscribing — otherwise it opens as anon and RLS drops every event.
       const tok = await getToken();
       if (tok) supabase.realtime.setAuth(tok);
-
+      if (cancelled) return;
       channel = supabase
-        .channel('flights-stream')
-        .on(
-          'postgres_changes',
-          { event: '*', schema: 'public', table: 'flights' },
-          payload => {
-            bufferedEvents++;
-            if (payload.eventType === 'DELETE') {
-              const row = payload.old as Flight;
-              pending.set(row.icao24, { kind: 'delete', row });
-            } else {
-              const row = payload.new as Flight;
-              pending.set(row.icao24, { kind: 'upsert', row });
-            }
-            scheduleFlush();
-          },
-        )
-        .subscribe(status => console.log('[realtime] channel status:', status));
+        .channel('flights-heartbeat')
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'flights' }, () => {
+          scheduleRealtimeRefetch();
+        })
+        .subscribe(status => {
+          console.log('[realtime] flights channel:', status);
+        });
     })();
 
     return () => {
       cancelled = true;
-      if (flushTimer) clearTimeout(flushTimer);
+      if (pollTimer) clearTimeout(pollTimer);
+      if (debounceTimer) clearTimeout(debounceTimer);
       if (channel) supabase.removeChannel(channel);
     };
   }, [supabase, getToken]);
@@ -163,14 +162,14 @@ export default function MapClient() {
     if (prefs?.filter_country) {
       list = list.filter(f => f.origin_country === prefs.filter_country);
     }
-    // Stable stride sample so the subset doesn't flicker as realtime events
-    // replace existing rows. Sorting by icao24 gives a deterministic order.
-    list.sort((a, b) => (a.icao24 < b.icao24 ? -1 : 1));
     if (list.length <= density) return list;
-    const stride = list.length / density;
-    const picked: Flight[] = [];
-    for (let i = 0; i < density; i++) picked.push(list[Math.floor(i * stride)]);
-    return picked;
+    // Stable membership sample: each aircraft's inclusion depends only on its
+    // icao24, not on what else is in the pool. This way the subset stays
+    // identity-stable across refreshes — planes visibly move instead of being
+    // swapped out by stride-index shifts when the total count changes.
+    const scored = list.map(f => [hashIcao(f.icao24), f] as const);
+    scored.sort((a, b) => a[0] - b[0]);
+    return scored.slice(0, density).map(([, f]) => f);
   }, [flights, prefs?.filter_country, density]);
 
   // Emergency squawks should never be sampled away — union them in.
@@ -199,14 +198,14 @@ export default function MapClient() {
               }`}
             />
             <span className="text-slate-300">Realtime</span>
-            <span className="text-slate-500 ml-auto">{eventCount.toLocaleString()} events</span>
+            <span className="text-slate-500 ml-auto">{refreshCount.toLocaleString()} refreshes</span>
           </div>
           <p className="text-slate-500">
             Last update:{' '}
             {lastUpdate ? `${Math.max(0, Math.round((Date.now() - lastUpdate) / 1000))}s ago` : 'waiting…'}
           </p>
           <p className="text-slate-500">
-            Source: OpenSky Network → worker → Supabase Realtime
+            Source: adsb.lol → Railway worker → Supabase Realtime
           </p>
         </div>
 

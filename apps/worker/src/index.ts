@@ -14,28 +14,70 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
 
 const pollMs = Number(POLL_INTERVAL_MS ?? 15_000);
 
-// adsb.lol /v2/point/{lat}/{lon}/{radius_nm} — radius capped at 250 nm. No auth,
-// no rate limit. We cover the major traffic regions with overlapping circles.
-// Aircraft present in multiple circles dedupe on icao24 upsert downstream.
+// adsb.lol /v2/point/{lat}/{lon}/{radius_nm} — radius capped at 250 nm (~463
+// km). No auth, no rate limit. 250 nm circles don't tile a continent when
+// placed at major-city centers, so we densify the grid across populated land
+// masses and major flight corridors. Aircraft in overlapping circles dedupe
+// on icao24 downstream. Open-ocean coverage is inherently sparse — ADS-B
+// receivers need to be on land — so mid-Atlantic/mid-Pacific gaps are real.
 const POINTS: Array<{ lat: number; lon: number; dist: number; name: string }> = [
+  // North America — continental tiling
+  { lat: 33, lon: -117, dist: 250, name: 'US-SoCal' },
+  { lat: 37, lon: -122, dist: 250, name: 'US-NorCal' },
+  { lat: 47, lon: -122, dist: 250, name: 'US-PNW' },
+  { lat: 40, lon: -105, dist: 250, name: 'US-Denver' },
+  { lat: 36, lon: -115, dist: 250, name: 'US-Vegas' },
+  { lat: 33, lon: -97, dist: 250, name: 'US-DFW' },
+  { lat: 30, lon: -90, dist: 250, name: 'US-NOLA' },
   { lat: 40, lon: -95, dist: 250, name: 'US-Central' },
-  { lat: 40, lon: -75, dist: 250, name: 'US-East' },
-  { lat: 35, lon: -115, dist: 250, name: 'US-West' },
-  { lat: 25, lon: -80, dist: 250, name: 'US-South' },
-  { lat: 50, lon: 10, dist: 250, name: 'EU-Central' },
-  { lat: 51, lon: 0, dist: 250, name: 'UK' },
-  { lat: 41, lon: 2, dist: 250, name: 'Iberia/Med' },
-  { lat: 55, lon: 37, dist: 250, name: 'Moscow' },
-  { lat: 35, lon: 139, dist: 250, name: 'Japan' },
-  { lat: 22, lon: 114, dist: 250, name: 'HK/PRD' },
-  { lat: 39, lon: 117, dist: 250, name: 'N-China' },
-  { lat: 1, lon: 104, dist: 250, name: 'Singapore' },
-  { lat: -33, lon: 151, dist: 250, name: 'Sydney' },
-  { lat: 19, lon: 73, dist: 250, name: 'India' },
-  { lat: 25, lon: 55, dist: 250, name: 'Dubai' },
-  { lat: -23, lon: -46, dist: 250, name: 'Sao Paulo' },
+  { lat: 45, lon: -93, dist: 250, name: 'US-MN' },
+  { lat: 33, lon: -84, dist: 250, name: 'US-ATL' },
+  { lat: 40, lon: -75, dist: 250, name: 'US-NE' },
+  { lat: 43, lon: -79, dist: 250, name: 'Toronto' },
+  { lat: 25, lon: -80, dist: 250, name: 'US-Miami' },
   { lat: 19, lon: -99, dist: 250, name: 'Mexico City' },
-  { lat: -34, lon: 18, dist: 250, name: 'Cape Town' },
+  { lat: 18, lon: -66, dist: 250, name: 'Puerto Rico' },
+  // South America
+  { lat: 4, lon: -74, dist: 250, name: 'Bogota' },
+  { lat: -12, lon: -77, dist: 250, name: 'Lima' },
+  { lat: -23, lon: -46, dist: 250, name: 'Sao Paulo' },
+  { lat: -34, lon: -58, dist: 250, name: 'Buenos Aires' },
+  // Europe
+  { lat: 51, lon: 0, dist: 250, name: 'UK' },
+  { lat: 41, lon: 2, dist: 250, name: 'Iberia' },
+  { lat: 50, lon: 10, dist: 250, name: 'EU-Central' },
+  { lat: 48, lon: 16, dist: 250, name: 'Vienna' },
+  { lat: 52, lon: 21, dist: 250, name: 'Warsaw' },
+  { lat: 41, lon: 12, dist: 250, name: 'Rome' },
+  { lat: 60, lon: 18, dist: 250, name: 'Stockholm' },
+  { lat: 55, lon: 37, dist: 250, name: 'Moscow' },
+  // Africa
+  { lat: 30, lon: 31, dist: 250, name: 'Cairo' },
+  { lat: 6, lon: 3, dist: 250, name: 'Lagos' },
+  { lat: -1, lon: 36, dist: 250, name: 'Nairobi' },
+  { lat: -33, lon: 18, dist: 250, name: 'Cape Town' },
+  // Middle East + India
+  { lat: 31, lon: 35, dist: 250, name: 'Jerusalem' },
+  { lat: 24, lon: 46, dist: 250, name: 'Riyadh' },
+  { lat: 25, lon: 55, dist: 250, name: 'Dubai' },
+  { lat: 28, lon: 77, dist: 250, name: 'Delhi' },
+  { lat: 19, lon: 73, dist: 250, name: 'Mumbai' },
+  { lat: 13, lon: 77, dist: 250, name: 'Bangalore' },
+  // East + SE Asia
+  { lat: 13, lon: 100, dist: 250, name: 'Bangkok' },
+  { lat: 1, lon: 104, dist: 250, name: 'Singapore' },
+  { lat: 14, lon: 121, dist: 250, name: 'Manila' },
+  { lat: 22, lon: 114, dist: 250, name: 'HK/PRD' },
+  { lat: 25, lon: 121, dist: 250, name: 'Taipei' },
+  { lat: 31, lon: 121, dist: 250, name: 'Shanghai' },
+  { lat: 39, lon: 117, dist: 250, name: 'Beijing' },
+  { lat: 37, lon: 127, dist: 250, name: 'Seoul' },
+  { lat: 35, lon: 139, dist: 250, name: 'Tokyo' },
+  // Oceania
+  { lat: -27, lon: 153, dist: 250, name: 'Brisbane' },
+  { lat: -33, lon: 151, dist: 250, name: 'Sydney' },
+  { lat: -37, lon: 145, dist: 250, name: 'Melbourne' },
+  { lat: -41, lon: 175, dist: 250, name: 'Wellington' },
 ];
 
 // adsb.lol aircraft shape (only the fields we care about).
