@@ -38,3 +38,4 @@ next-env.d.ts
 
 # docx lock files
 ~$*.docx
+Design, Build, Ship*.docx
